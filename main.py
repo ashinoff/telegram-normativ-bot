@@ -3,6 +3,9 @@ import logging
 import asyncio
 from typing import List, Dict
 from dotenv import load_dotenv
+from aiohttp import web
+import threading
+import aiohttp
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -14,9 +17,12 @@ load_dotenv()
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 FOLDER_ID = os.environ.get('FOLDER_ID')
 API_KEY = os.environ.get('YANDEX_API_KEY')
-MODEL = "yandexgpt-lite"
+MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
 TEMPERATURE = 0.3
 MAX_TOKENS = 2000
+
+# Выбор метода работы с YandexGPT (SDK или HTTP)
+USE_SDK = True  # Поставьте False, если SDK не работает
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -103,9 +109,76 @@ class SimpleDocumentSearch:
         
         return result
 
+# ====================== YANDEXGPT HELPERS ======================
+async def call_yandexgpt_http(messages: List[Dict], temperature: float, max_tokens: int) -> str:
+    """Альтернативный метод вызова YandexGPT через HTTP API"""
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+    headers = {
+        "Authorization": f"Api-Key {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "modelUri": MODEL_URI,
+        "completionOptions": {
+            "stream": False,
+            "temperature": temperature,
+            "maxTokens": max_tokens
+        },
+        "messages": messages
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data, headers=headers) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"YandexGPT API error: {response.status} - {error_text}")
+            
+            result = await response.json()
+            return result["result"]["alternatives"][0]["message"]["text"]
+
+async def call_yandexgpt_sdk(sdk: AsyncYCloudML, messages: List[Dict], temperature: float, max_tokens: int) -> str:
+    """Вызов YandexGPT через SDK"""
+    try:
+        # Создаем модель
+        model = sdk.models.completions(MODEL_URI)
+        
+        # Выполняем запрос
+        result = await model.run(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        return result.alternatives[0].text
+    except Exception as e:
+        logger.error(f"SDK error: {e}")
+        # Если SDK не работает, пробуем через HTTP
+        logger.info("Переключаемся на HTTP метод...")
+        return await call_yandexgpt_http(messages, temperature, max_tokens)
+
 # ====================== ИНИЦИАЛИЗАЦИЯ ======================
-sdk_async = AsyncYCloudML(folder_id=FOLDER_ID, auth=API_KEY)
+sdk_async = AsyncYCloudML(folder_id=FOLDER_ID, auth=API_KEY) if USE_SDK else None
 searcher = SimpleDocumentSearch()
+
+# ====================== HEALTH CHECK SERVER ======================
+async def health_check(request):
+    """Простой health check endpoint для Render"""
+    return web.Response(text="Bot is running", status=200)
+
+def run_health_server():
+    """Запускаем простой веб-сервер для health checks"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    # Получаем порт из переменной окружения (Render устанавливает PORT)
+    port = int(os.environ.get('PORT', 10000))
+    
+    try:
+        web.run_app(app, host='0.0.0.0', port=port, print=lambda _: None)
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
 
 # ====================== ОБРАБОТЧИКИ ======================
 async def start(update: Update, context):
@@ -136,10 +209,24 @@ async def list_docs(update: Update, context):
         f"📚 Загруженные документы:\n\n{file_list}"
     )
 
+async def reload_docs(update: Update, context):
+    """Перезагрузить документы"""
+    await update.message.reply_text("🔄 Перезагружаю документы...")
+    
+    searcher.documents = []
+    searcher.load_documents()
+    
+    await update.message.reply_text(
+        f"✅ Документы перезагружены!\n"
+        f"📄 Загружено: {len(searcher.documents)} файлов"
+    )
+
 async def handle_message(update: Update, context):
     """Обработчик текстовых сообщений"""
     user_message = update.message.text
+    user_name = update.effective_user.first_name or "Пользователь"
     
+    # Показываем, что бот печатает
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, 
         action="typing"
@@ -154,60 +241,97 @@ async def handle_message(update: Update, context):
         sources = []
         
         if search_results:
+            logger.info(f"Найдено {len(search_results)} документов для запроса: {user_message}")
             for result in search_results:
                 context_text += f"\nИз файла {result['filename']}:\n{result['content']}\n"
                 sources.append(result['filename'])
+        else:
+            logger.info(f"Документы не найдены для запроса: {user_message}")
         
         # Промпт для YandexGPT
-        system_prompt = """Ты - эксперт по ППРФ 442. Отвечай на основе предоставленных документов.
-Если информации недостаточно, скажи об этом. Структурируй ответы, указывай пункты ППРФ."""
+        system_prompt = """Ты - эксперт по постановлению правительства РФ №442 (ППРФ 442).
+Отвечай на основе предоставленных документов.
+Если информации недостаточно, скажи об этом.
+Структурируй ответы, указывай конкретные пункты ППРФ.
+Будь дружелюбным и полезным."""
         
         messages = [{"role": "system", "text": system_prompt}]
         
         if context_text:
-            prompt = f"Документы:\n{context_text}\n\nВопрос: {user_message}"
+            prompt = f"Документы:\n{context_text}\n\nВопрос от {user_name}: {user_message}"
         else:
-            prompt = f"Вопрос: {user_message}\n\nВ документах информация не найдена. Что можешь сказать из общих знаний?"
+            prompt = (f"Вопрос от {user_name}: {user_message}\n\n"
+                     "В загруженных документах информация не найдена. "
+                     "Ответь на основе общих знаний о ППРФ 442, если возможно.")
         
         messages.append({"role": "user", "text": prompt})
         
-        # Запрос к YandexGPT
-        result = await sdk_async.models.completions(
-            model=MODEL,
-            messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS
-        )
-        
-        response_text = result.alternatives[0].text
+        # Вызов YandexGPT
+        if USE_SDK and sdk_async:
+            response_text = await call_yandexgpt_sdk(sdk_async, messages, TEMPERATURE, MAX_TOKENS)
+        else:
+            response_text = await call_yandexgpt_http(messages, TEMPERATURE, MAX_TOKENS)
         
         # Добавляем источники
         if sources:
             response_text += f"\n\n📎 _Источники: {', '.join(set(sources))}_"
         
+        # Отправляем ответ
         await update.message.reply_text(response_text, parse_mode='Markdown')
         
+        # Логируем успешный ответ
+        logger.info(f"Успешно обработан запрос от {user_name}")
+        
     except Exception as e:
-        logger.error(f"Ошибка: {e}", exc_info=True)
-        await update.message.reply_text(
-            "😔 Произошла ошибка. Попробуйте переформулировать вопрос."
+        logger.error(f"Ошибка при обработке сообщения: {e}", exc_info=True)
+        
+        error_message = (
+            "😔 Произошла ошибка при обработке вашего запроса.\n\n"
+            "Возможные причины:\n"
+            "• Проблема с подключением к YandexGPT\n"
+            "• Слишком длинный запрос\n"
+            "• Временные технические проблемы\n\n"
+            "Попробуйте:\n"
+            "• Переформулировать вопрос короче\n"
+            "• Повторить попытку через минуту"
         )
+        
+        await update.message.reply_text(error_message)
 
 # ====================== ГЛАВНАЯ ФУНКЦИЯ ======================
 def main():
     """Запуск бота"""
+    # Проверка переменных окружения
     if not all([BOT_TOKEN, FOLDER_ID, API_KEY]):
-        logger.error("Не заданы переменные окружения!")
+        logger.error("Не заданы необходимые переменные окружения!")
+        logger.error("Требуются: BOT_TOKEN, FOLDER_ID, YANDEX_API_KEY")
         return
     
+    # Запускаем health check сервер в отдельном потоке (для Render)
+    if os.environ.get('PORT'):
+        health_thread = threading.Thread(target=run_health_server, daemon=True)
+        health_thread.start()
+        logger.info("🌐 Health check сервер запущен")
+    
+    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("docs", list_docs))
+    application.add_handler(CommandHandler("reload", reload_docs))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info(f"🤖 Бот запущен! Документов: {len(searcher.documents)}")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем бота
+    logger.info(f"🤖 Бот запущен!")
+    logger.info(f"📄 Загружено документов: {len(searcher.documents)}")
+    logger.info(f"🔧 Метод API: {'SDK' if USE_SDK else 'HTTP'}")
+    
+    # Запускаем polling
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True  # Игнорируем старые сообщения
+    )
 
 if __name__ == '__main__':
     main()
