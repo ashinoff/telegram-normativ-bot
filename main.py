@@ -24,11 +24,41 @@ MAX_TOKENS = 2000
 # Выбор метода работы с YandexGPT (SDK или HTTP)
 USE_SDK = True  # Поставьте False, если SDK не работает
 
+# ====================== БЕЗОПАСНАЯ НАСТРОЙКА ЛОГИРОВАНИЯ ======================
+# Настраиваем основной логгер
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ВАЖНО: Отключаем логирование httpx, чтобы не показывать токены
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
+
+# Альтернативный вариант - создать кастомный фильтр для логов
+class TokenFilter(logging.Filter):
+    """Фильтр для скрытия токенов в логах"""
+    def __init__(self, token):
+        super().__init__()
+        self.token = token
+        self.masked_token = token[:6] + "..." + token[-4:] if token else ""
+    
+    def filter(self, record):
+        if self.token and hasattr(record, 'msg'):
+            record.msg = str(record.msg).replace(self.token, self.masked_token)
+        return True
+
+# Применяем фильтр ко всем хендлерам
+if BOT_TOKEN:
+    token_filter = TokenFilter(BOT_TOKEN)
+    for handler in logging.root.handlers:
+        handler.addFilter(token_filter)
+
+# Создаем безопасный логгер для отладки Telegram
+telegram_logger = logging.getLogger('telegram')
+telegram_logger.setLevel(logging.WARNING)  # Только предупреждения и ошибки
 
 # ====================== ПРОСТОЙ ПОИСК БЕЗ EMBEDDINGS ======================
 class SimpleDocumentSearch:
@@ -113,6 +143,11 @@ class SimpleDocumentSearch:
 async def call_yandexgpt_http(messages: List[Dict], temperature: float, max_tokens: int) -> str:
     """Альтернативный метод вызова YandexGPT через HTTP API"""
     url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+    
+    # Маскируем API ключ в логах
+    masked_api_key = API_KEY[:8] + "..." + API_KEY[-4:] if API_KEY else "not_set"
+    logger.debug(f"Вызов YandexGPT API (ключ: {masked_api_key})")
+    
     headers = {
         "Authorization": f"Api-Key {API_KEY}",
         "Content-Type": "application/json"
@@ -176,7 +211,11 @@ def run_health_server():
     port = int(os.environ.get('PORT', 10000))
     
     try:
-        web.run_app(app, host='0.0.0.0', port=port, print=lambda _: None)
+        # Отключаем access логи aiohttp чтобы не спамить
+        access_logger = logging.getLogger('aiohttp.access')
+        access_logger.setLevel(logging.WARNING)
+        
+        web.run_app(app, host='0.0.0.0', port=port, print=lambda _: None, access_log=None)
     except Exception as e:
         logger.error(f"Health server error: {e}")
 
@@ -184,9 +223,10 @@ def run_health_server():
 async def start(update: Update, context):
     """Обработчик команды /start"""
     docs_count = len(searcher.documents)
+    user_name = update.effective_user.first_name or "Друг"
     
     await update.message.reply_text(
-        "👋 Привет! Я бот-помощник по нормативным документам ППРФ 442.\n\n"
+        f"👋 Привет, {user_name}! Я бот-помощник по нормативным документам ППРФ 442.\n\n"
         "📚 Могу ответить на вопросы по:\n"
         "• Коммерческому учету электроэнергии\n"
         "• Установке и замене приборов учета\n"
@@ -196,6 +236,9 @@ async def start(update: Update, context):
         f"📄 Загружено документов: {docs_count}\n\n"
         "❓ Просто задайте ваш вопрос!"
     )
+    
+    # Логируем без показа чувствительных данных
+    logger.info(f"Пользователь {user_name} (ID: {update.effective_user.id}) запустил бота")
 
 async def list_docs(update: Update, context):
     """Показать список загруженных документов"""
@@ -211,6 +254,14 @@ async def list_docs(update: Update, context):
 
 async def reload_docs(update: Update, context):
     """Перезагрузить документы"""
+    user_id = update.effective_user.id
+    
+    # Можно добавить проверку прав доступа
+    # ADMIN_IDS = [123456789]  # Список ID администраторов
+    # if user_id not in ADMIN_IDS:
+    #     await update.message.reply_text("⛔ У вас нет прав для этой команды")
+    #     return
+    
     await update.message.reply_text("🔄 Перезагружаю документы...")
     
     searcher.documents = []
@@ -220,11 +271,17 @@ async def reload_docs(update: Update, context):
         f"✅ Документы перезагружены!\n"
         f"📄 Загружено: {len(searcher.documents)} файлов"
     )
+    
+    logger.info(f"Пользователь ID:{user_id} перезагрузил документы")
 
 async def handle_message(update: Update, context):
     """Обработчик текстовых сообщений"""
     user_message = update.message.text
+    user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "Пользователь"
+    
+    # Логируем запрос без показа содержимого (для приватности)
+    logger.info(f"Получен запрос от {user_name} (ID: {user_id}), длина: {len(user_message)} символов")
     
     # Показываем, что бот печатает
     await context.bot.send_chat_action(
@@ -241,12 +298,12 @@ async def handle_message(update: Update, context):
         sources = []
         
         if search_results:
-            logger.info(f"Найдено {len(search_results)} документов для запроса: {user_message}")
+            logger.info(f"Найдено {len(search_results)} документов")
             for result in search_results:
                 context_text += f"\nИз файла {result['filename']}:\n{result['content']}\n"
                 sources.append(result['filename'])
         else:
-            logger.info(f"Документы не найдены для запроса: {user_message}")
+            logger.info("Релевантные документы не найдены")
         
         # Промпт для YandexGPT
         system_prompt = """Ты - эксперт по постановлению правительства РФ №442 (ППРФ 442).
@@ -280,10 +337,10 @@ async def handle_message(update: Update, context):
         await update.message.reply_text(response_text, parse_mode='Markdown')
         
         # Логируем успешный ответ
-        logger.info(f"Успешно обработан запрос от {user_name}")
+        logger.info(f"Успешно отправлен ответ пользователю ID:{user_id}")
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке сообщения: {e}", exc_info=True)
+        logger.error(f"Ошибка при обработке сообщения от ID:{user_id}: {type(e).__name__}: {str(e)}")
         
         error_message = (
             "😔 Произошла ошибка при обработке вашего запроса.\n\n"
@@ -306,6 +363,10 @@ def main():
         logger.error("Не заданы необходимые переменные окружения!")
         logger.error("Требуются: BOT_TOKEN, FOLDER_ID, YANDEX_API_KEY")
         return
+    
+    # Показываем маскированный токен для отладки
+    masked_token = BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:] if BOT_TOKEN else "not_set"
+    logger.info(f"Используется бот с токеном: {masked_token}")
     
     # Запускаем health check сервер в отдельном потоке (для Render)
     if os.environ.get('PORT'):
